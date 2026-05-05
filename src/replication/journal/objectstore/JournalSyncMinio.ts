@@ -228,9 +228,10 @@ export class JournalSyncMinio extends JournalSyncAbstract {
                 ContinuationToken: continuationToken,
             });
             files.push(
-                ...((objects.Contents?.filter((e) => e.Key?.startsWith(this.prefix)).map((e) =>
-                    e.Key?.substring(this.prefix.length)
-                ) as string[]) ?? [])
+                ...(objects.Contents ?? [])
+                    .map((e) => e.Key)
+                    .filter((key): key is string => typeof key === "string" && key.startsWith(this.prefix))
+                    .map((key) => key.substring(this.prefix.length))
             );
             continuationToken = objects.NextContinuationToken;
         } while (continuationToken);

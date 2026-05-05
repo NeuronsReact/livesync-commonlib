@@ -307,8 +307,8 @@ export abstract class JournalSyncAbstract {
     abstract listFiles(from: string, limit?: number): Promise<string[]>;
     abstract listFilesByPrefix(prefix: string): Promise<string[]>;
     abstract isAvailable(): Promise<boolean>;
-    async uploadDeviceState(state: DeviceStateDocument): Promise<boolean> {
-        return (await this.uploadJson(getDeviceStateObjectKey(state.device_id), state)) !== false;
+    async uploadDeviceState(deviceId: DeviceID, state: DeviceStateDocument): Promise<boolean> {
+        return (await this.uploadJson(getDeviceStateObjectKey(deviceId), state)) !== false;
     }
     async downloadDeviceState(deviceId: DeviceID): Promise<DeviceStateDocument | false> {
         const state = await this.downloadJson<DeviceStateDocument>(getDeviceStateObjectKey(deviceId));

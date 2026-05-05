@@ -23,7 +23,6 @@ import {
     type RawJournalBoundary,
     computeCursorFromJournalFileSets,
     getActiveDeviceStates,
-    mergeDeviceStateForUpload,
 } from "./JournalSyncTypes.ts";
 import { fireAndForget, type SimpleStore } from "../../common/utils.ts";
 
@@ -156,18 +155,12 @@ export class LiveSyncJournalReplicator extends LiveSyncAbstractReplicator {
             if (this.nodeid == "") return;
             const checkpoint = await this.client.getCheckpointInfo();
             const cursor = computeCursorFromJournalFileSets(checkpoint.receivedFiles, checkpoint.sentFiles);
-            const previous = await this.client.downloadDeviceState(this.nodeid);
-            const next: DeviceStateDocument = {
-                device_id: this.nodeid,
+            const uploadState: DeviceStateDocument = {
                 cursor,
-                manifest_seen_generation: previous ? previous.manifest_seen_generation : 0,
-                ...(previous && previous.last_applied_edit_seq !== undefined
-                    ? { last_applied_edit_seq: previous.last_applied_edit_seq }
-                    : {}),
+                manifest_seen_generation: 0,
                 last_heartbeat: Date.now(),
             };
-            const uploadState = mergeDeviceStateForUpload(previous, next);
-            if (await this.client.uploadDeviceState(uploadState)) {
+            if (await this.client.uploadDeviceState(this.nodeid, uploadState)) {
                 this.lastDeviceStateReportAt = uploadState.last_heartbeat;
                 this.lastDeviceStateReportCursor = uploadState.cursor;
                 Logger(`Device state reported after journal ${reason}`, LOG_LEVEL_VERBOSE);

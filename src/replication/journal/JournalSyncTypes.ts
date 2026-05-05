@@ -23,7 +23,6 @@ export type RawJournalBoundary = RawJournalKey | null;
 export type DeviceStateKind = "active" | "stale" | "retired";
 
 export interface DeviceStateDocument {
-    device_id: DeviceID;
     cursor: RawJournalBoundary;
     manifest_seen_generation: Generation;
     last_applied_edit_seq?: EditSeq;
@@ -110,7 +109,6 @@ function isRawJournalBoundary(value: unknown): value is RawJournalBoundary {
 
 export function isDeviceStateDocument(value: unknown): value is DeviceStateDocument {
     if (!isRecord(value)) return false;
-    if (typeof value.device_id !== "string" || value.device_id.length === 0) return false;
     if (!isRawJournalBoundary(value.cursor)) return false;
     if (typeof value.manifest_seen_generation !== "number" || !Number.isFinite(value.manifest_seen_generation)) {
         return false;
@@ -123,26 +121,6 @@ export function isDeviceStateDocument(value: unknown): value is DeviceStateDocum
     }
     if (value.state !== undefined && !isDeviceStateKind(value.state)) return false;
     return true;
-}
-
-export function mergeDeviceStateForUpload(
-    previous: DeviceStateDocument | false | undefined,
-    next: DeviceStateDocument
-): DeviceStateDocument {
-    if (!previous) return next;
-    const lastAppliedEditSeq =
-        previous.last_applied_edit_seq === undefined && next.last_applied_edit_seq === undefined
-            ? undefined
-            : Math.max(previous.last_applied_edit_seq ?? 0, next.last_applied_edit_seq ?? 0);
-    const merged: DeviceStateDocument = {
-        ...next,
-        cursor: compareRawJournalBoundaries(previous.cursor, next.cursor) > 0 ? previous.cursor : next.cursor,
-        manifest_seen_generation: Math.max(previous.manifest_seen_generation, next.manifest_seen_generation),
-    };
-    if (lastAppliedEditSeq !== undefined) {
-        merged.last_applied_edit_seq = lastAppliedEditSeq;
-    }
-    return merged;
 }
 
 export function getActiveDeviceStates(

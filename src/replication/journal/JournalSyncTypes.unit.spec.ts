@@ -10,7 +10,6 @@ import {
     getActiveDeviceStates,
     getDeviceStateObjectKey,
     isDeviceStateDocument,
-    mergeDeviceStateForUpload,
     shouldReportDeviceStateByCursorAdvance,
     type DeviceStateDocument,
 } from "./JournalSyncTypes.ts";
@@ -62,13 +61,11 @@ describe("JournalSyncTypes", () => {
 
     it("validates device state documents", () => {
         const valid = {
-            device_id: "device-a",
             cursor: "10-docs.jsonl.gz",
             manifest_seen_generation: 0,
             last_heartbeat: 1000,
         } satisfies DeviceStateDocument;
         expect(isDeviceStateDocument(valid)).toBe(true);
-        expect(isDeviceStateDocument({ ...valid, device_id: "" })).toBe(false);
         expect(isDeviceStateDocument({ ...valid, cursor: 1 })).toBe(false);
         expect(isDeviceStateDocument({ ...valid, manifest_seen_generation: "0" })).toBe(false);
         expect(isDeviceStateDocument({ ...valid, last_heartbeat: "1000" })).toBe(false);
@@ -76,47 +73,20 @@ describe("JournalSyncTypes", () => {
         expect(isDeviceStateDocument({ ...valid, last_applied_edit_seq: "1" })).toBe(false);
     });
 
-    it("merges device state without cursor, generation, or edit seq regression", () => {
-        const previous = {
-            device_id: "device-a",
-            cursor: "10-docs.jsonl.gz",
-            manifest_seen_generation: 4,
-            last_applied_edit_seq: 3,
-            last_heartbeat: 1000,
-        } satisfies DeviceStateDocument;
-        const next = {
-            device_id: "device-a",
-            cursor: "2-docs.jsonl.gz",
-            manifest_seen_generation: 2,
-            last_applied_edit_seq: 1,
-            last_heartbeat: 2000,
-        } satisfies DeviceStateDocument;
-        expect(mergeDeviceStateForUpload(previous, next)).toEqual({
-            ...next,
-            cursor: "10-docs.jsonl.gz",
-            manifest_seen_generation: 4,
-            last_applied_edit_seq: 3,
-        });
-    });
-
     it("filters active device states by heartbeat window and state", () => {
         const now = 10_000;
         const active = {
-            device_id: "active",
             cursor: null,
             manifest_seen_generation: 0,
             last_heartbeat: now - ACTIVE_HEARTBEAT_WINDOW_MS,
         } satisfies DeviceStateDocument;
         const old = {
             ...active,
-            device_id: "old",
             last_heartbeat: now - ACTIVE_HEARTBEAT_WINDOW_MS - 1,
         } satisfies DeviceStateDocument;
-        const stale = { ...active, device_id: "stale", state: "stale" } satisfies DeviceStateDocument;
-        const retired = { ...active, device_id: "retired", state: "retired" } satisfies DeviceStateDocument;
-        expect(getActiveDeviceStates([active, old, stale, retired], now).map((state) => state.device_id)).toEqual([
-            "active",
-        ]);
+        const stale = { ...active, state: "stale" } satisfies DeviceStateDocument;
+        const retired = { ...active, state: "retired" } satisfies DeviceStateDocument;
+        expect(getActiveDeviceStates([active, old, stale, retired], now)).toEqual([active]);
     });
 
     it("reports cursor advance only after threshold and minimum interval", () => {
