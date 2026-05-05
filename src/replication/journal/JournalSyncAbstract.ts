@@ -28,7 +28,15 @@ import {
 import { shareRunningResult } from "octagonal-wheels/concurrency/lock";
 import { wrappedDeflate } from "../../pouchdb/compress.ts";
 import { wrappedInflate } from "../../pouchdb/compress.ts";
-import { type CheckPointInfo, CheckPointInfoDefault } from "./JournalSyncTypes.ts";
+import {
+    type CheckPointInfo,
+    CheckPointInfoDefault,
+    type DeviceID,
+    type DeviceStateDocument,
+    JOURNAL_DEVICE_STATE_PREFIX,
+    getDeviceStateObjectKey,
+    isDeviceStateDocument,
+} from "./JournalSyncTypes.ts";
 import type { LiveSyncJournalReplicatorEnv } from "./LiveSyncJournalReplicatorEnv.ts";
 import { Trench } from "octagonal-wheels/memory/memutil";
 import { Notifier } from "octagonal-wheels/concurrency/processor";
@@ -297,7 +305,30 @@ export abstract class JournalSyncAbstract {
     abstract uploadFile(key: string, blob: Blob, mime: string): Promise<boolean>;
     abstract downloadFile(key: string): Promise<Uint8Array | false>;
     abstract listFiles(from: string, limit?: number): Promise<string[]>;
+    abstract listFilesByPrefix(prefix: string): Promise<string[]>;
     abstract isAvailable(): Promise<boolean>;
+    async uploadDeviceState(state: DeviceStateDocument): Promise<boolean> {
+        return (await this.uploadJson(getDeviceStateObjectKey(state.device_id), state)) !== false;
+    }
+    async downloadDeviceState(deviceId: DeviceID): Promise<DeviceStateDocument | false> {
+        const state = await this.downloadJson<DeviceStateDocument>(getDeviceStateObjectKey(deviceId));
+        if (!isDeviceStateDocument(state)) return false;
+        return state;
+    }
+    async listRemoteDeviceStates(): Promise<DeviceStateDocument[]> {
+        const deviceStateKeys = await this.listFilesByPrefix(JOURNAL_DEVICE_STATE_PREFIX);
+        const states = await Promise.all(
+            deviceStateKeys.map(async (key) => {
+                const state = await this.downloadJson<DeviceStateDocument>(key);
+                if (!isDeviceStateDocument(state)) {
+                    Logger(`Invalid device state skipped: ${key}`, LOG_LEVEL_VERBOSE);
+                    return false;
+                }
+                return state;
+            })
+        );
+        return states.filter((state): state is DeviceStateDocument => state !== false);
+    }
     getRemoteKey(): string {
         return this.getHash(this._settings);
     }

@@ -17,7 +17,14 @@ import { JournalSyncMinio } from "./objectstore/JournalSyncMinio.ts";
 
 import { LiveSyncAbstractReplicator, type RemoteDBStatus } from "../LiveSyncAbstractReplicator.ts";
 import { ensureRemoteIsCompatible, type ENSURE_DB_RESULT } from "../../pouchdb/LiveSyncDBFunctions.ts";
-import type { CheckPointInfo } from "./JournalSyncTypes.ts";
+import {
+    type CheckPointInfo,
+    type DeviceStateDocument,
+    type RawJournalBoundary,
+    computeCursorFromJournalFileSets,
+    getActiveDeviceStates,
+    mergeDeviceStateForUpload,
+} from "./JournalSyncTypes.ts";
 import { fireAndForget, type SimpleStore } from "../../common/utils.ts";
 
 import { extractObject } from "../../common/utils.ts";
@@ -46,6 +53,8 @@ export class LiveSyncJournalReplicator extends LiveSyncAbstractReplicator {
         return this.env.services.keyValueDB.simpleStore as SimpleStore<CheckPointInfo>;
     }
     _client!: JournalSyncMinio;
+    lastDeviceStateReportAt = 0;
+    lastDeviceStateReportCursor: RawJournalBoundary = null;
 
     override async getReplicationPBKDF2Salt(
         setting: RemoteDBSettings,
@@ -114,18 +123,75 @@ export class LiveSyncJournalReplicator extends LiveSyncAbstractReplicator {
 
     async openReplication(setting: RemoteDBSettings, _: boolean, showResult: boolean, ignoreCleanLock = false) {
         if (!(await this.checkReplicationConnectivity(false, ignoreCleanLock, showResult))) return false;
-        await this.client.sync(showResult);
-        return true;
+        const syncResult = await this.client.sync(showResult);
+        if (syncResult) {
+            await this.reportDeviceStateAfterSuccessfulSync("full-sync");
+        }
+        return !!syncResult;
     }
 
     async replicateAllToServer(setting: RemoteDBSettings, showingNotice?: boolean) {
         if (!(await this.checkReplicationConnectivity(false, false, !!showingNotice))) return false;
-        return await this.client.sendLocalJournal(showingNotice);
+        const syncResult = await this.client.sendLocalJournal(showingNotice);
+        if (syncResult) {
+            await this.reportDeviceStateAfterSuccessfulSync("push-only");
+        }
+        return syncResult;
     }
 
     async replicateAllFromServer(setting: RemoteDBSettings, showingNotice?: boolean) {
         if (!(await this.checkReplicationConnectivity(false, false, !!showingNotice))) return false;
-        return await this.client.receiveRemoteJournal(showingNotice);
+        const syncResult = await this.client.receiveRemoteJournal(showingNotice);
+        if (syncResult) {
+            await this.reportDeviceStateAfterSuccessfulSync("pull-only");
+        }
+        return syncResult;
+    }
+
+    async reportDeviceStateAfterSuccessfulSync(reason: "full-sync" | "pull-only" | "push-only"): Promise<void> {
+        try {
+            if (this.nodeid == "") {
+                await this.initializeDatabaseForReplication();
+            }
+            if (this.nodeid == "") return;
+            const checkpoint = await this.client.getCheckpointInfo();
+            const cursor = computeCursorFromJournalFileSets(checkpoint.receivedFiles, checkpoint.sentFiles);
+            const previous = await this.client.downloadDeviceState(this.nodeid);
+            const next: DeviceStateDocument = {
+                device_id: this.nodeid,
+                cursor,
+                manifest_seen_generation: previous ? previous.manifest_seen_generation : 0,
+                ...(previous && previous.last_applied_edit_seq !== undefined
+                    ? { last_applied_edit_seq: previous.last_applied_edit_seq }
+                    : {}),
+                last_heartbeat: Date.now(),
+            };
+            const uploadState = mergeDeviceStateForUpload(previous, next);
+            if (await this.client.uploadDeviceState(uploadState)) {
+                this.lastDeviceStateReportAt = uploadState.last_heartbeat;
+                this.lastDeviceStateReportCursor = uploadState.cursor;
+                Logger(`Device state reported after journal ${reason}`, LOG_LEVEL_VERBOSE);
+            }
+        } catch (ex) {
+            Logger(`Could not report device state after journal ${reason}`, LOG_LEVEL_VERBOSE);
+            Logger(ex, LOG_LEVEL_VERBOSE);
+        }
+    }
+
+    async getRemoteDeviceStates(): Promise<DeviceStateDocument[] | false> {
+        try {
+            return await this.client.listRemoteDeviceStates();
+        } catch (ex) {
+            Logger(`Could not retrieve remote device states`, LOG_LEVEL_VERBOSE);
+            Logger(ex, LOG_LEVEL_VERBOSE);
+            return false;
+        }
+    }
+
+    async getActiveRemoteDeviceStates(now = Date.now()): Promise<DeviceStateDocument[] | false> {
+        const states = await this.getRemoteDeviceStates();
+        if (states === false) return false;
+        return getActiveDeviceStates(states, now);
     }
 
     async checkReplicationConnectivity(skipCheck: boolean, ignoreCleanLock = false, showMessage = false) {

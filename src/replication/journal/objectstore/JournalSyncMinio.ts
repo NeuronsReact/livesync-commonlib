@@ -217,6 +217,26 @@ export class JournalSyncMinio extends JournalSyncAbstract {
         ) as string[];
     }
 
+    async listFilesByPrefix(prefix: string) {
+        const client = this._getClient();
+        const files = [] as string[];
+        let continuationToken: string | undefined;
+        do {
+            const objects = await client.listObjectsV2({
+                Bucket: this.bucket,
+                Prefix: `${this.prefix || ""}${prefix}`,
+                ContinuationToken: continuationToken,
+            });
+            files.push(
+                ...((objects.Contents?.filter((e) => e.Key?.startsWith(this.prefix)).map((e) =>
+                    e.Key?.substring(this.prefix.length)
+                ) as string[]) ?? [])
+            );
+            continuationToken = objects.NextContinuationToken;
+        } while (continuationToken);
+        return files;
+    }
+
     async isAvailable(): Promise<boolean> {
         const client = this._getClient();
         const cmd = new HeadBucketCommand({ Bucket: this.bucket });
