@@ -21,6 +21,7 @@ import {
     type CheckPointInfo,
     type DeviceStateDocument,
     type RawJournalBoundary,
+    compareRawJournalBoundaries,
     computeCursorFromJournalFileSets,
     getActiveDeviceStates,
 } from "./JournalSyncTypes.ts";
@@ -125,6 +126,7 @@ export class LiveSyncJournalReplicator extends LiveSyncAbstractReplicator {
         const syncResult = await this.client.sync(showResult);
         if (syncResult) {
             await this.reportDeviceStateAfterSuccessfulSync("full-sync");
+            this.schedulePrefixCompaction();
         }
         return !!syncResult;
     }
@@ -134,6 +136,7 @@ export class LiveSyncJournalReplicator extends LiveSyncAbstractReplicator {
         const syncResult = await this.client.sendLocalJournal(showingNotice);
         if (syncResult) {
             await this.reportDeviceStateAfterSuccessfulSync("push-only");
+            this.schedulePrefixCompaction();
         }
         return syncResult;
     }
@@ -143,6 +146,7 @@ export class LiveSyncJournalReplicator extends LiveSyncAbstractReplicator {
         const syncResult = await this.client.receiveRemoteJournal(showingNotice);
         if (syncResult) {
             await this.reportDeviceStateAfterSuccessfulSync("pull-only");
+            this.schedulePrefixCompaction();
         }
         return syncResult;
     }
@@ -155,9 +159,19 @@ export class LiveSyncJournalReplicator extends LiveSyncAbstractReplicator {
             if (this.nodeid == "") return;
             const checkpoint = await this.client.getCheckpointInfo();
             const cursor = computeCursorFromJournalFileSets(checkpoint.receivedFiles, checkpoint.sentFiles);
+            const appliedView = this.client.compaction.lastAppliedView || this.client.compaction.lastRestoredView;
+            const manifestSeenGeneration =
+                appliedView !== false && compareRawJournalBoundaries(cursor, appliedView.compacted_boundary) >= 0
+                    ? appliedView.generation
+                    : 0;
             const uploadState: DeviceStateDocument = {
                 cursor,
-                manifest_seen_generation: 0,
+                manifest_seen_generation: manifestSeenGeneration,
+                ...(appliedView !== false &&
+                manifestSeenGeneration === appliedView.generation &&
+                appliedView.applied_edit_seq !== undefined
+                    ? { last_applied_edit_seq: appliedView.applied_edit_seq }
+                    : {}),
                 last_heartbeat: Date.now(),
             };
             if (await this.client.uploadDeviceState(this.nodeid, uploadState)) {
@@ -169,6 +183,11 @@ export class LiveSyncJournalReplicator extends LiveSyncAbstractReplicator {
             Logger(`Could not report device state after journal ${reason}`, LOG_LEVEL_VERBOSE);
             Logger(ex, LOG_LEVEL_VERBOSE);
         }
+    }
+
+    schedulePrefixCompaction(): void {
+        if (this.nodeid == "") return;
+        fireAndForget(() => this.client.runPrefixCompaction(this.nodeid));
     }
 
     async getRemoteDeviceStates(): Promise<DeviceStateDocument[] | false> {

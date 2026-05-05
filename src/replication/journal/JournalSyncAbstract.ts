@@ -16,28 +16,24 @@ import {
 } from "../../common/types.ts";
 import { Logger } from "../../common/logger.ts";
 import type { ReplicationCallback, ReplicationStat } from "../LiveSyncAbstractReplicator.ts";
-import {
-    type SimpleStore,
-    concatUInt8Array,
-    delay,
-    escapeNewLineFromString,
-    parseHeaderValues,
-    setAllItems,
-    unescapeNewLineFromString,
-} from "../../common/utils.ts";
+import { type SimpleStore, concatUInt8Array, delay, parseHeaderValues, setAllItems } from "../../common/utils.ts";
 import { shareRunningResult } from "octagonal-wheels/concurrency/lock";
 import { wrappedDeflate } from "../../pouchdb/compress.ts";
-import { wrappedInflate } from "../../pouchdb/compress.ts";
 import {
     type CheckPointInfo,
     CheckPointInfoDefault,
+    type ConditionalUploadResult,
     type DeviceID,
     type DeviceStateDocument,
+    type DownloadedJsonWithMetadata,
     JOURNAL_DEVICE_STATE_PREFIX,
+    type ObjectStoreUploadCondition,
+    computeCursorFromJournalFileSets,
     getDeviceStateObjectKey,
     isDeviceStateDocument,
 } from "./JournalSyncTypes.ts";
 import type { LiveSyncJournalReplicatorEnv } from "./LiveSyncJournalReplicatorEnv.ts";
+import { JournalSyncCompaction } from "./JournalSyncCompaction.ts";
 import { Trench } from "octagonal-wheels/memory/memutil";
 import { Notifier } from "octagonal-wheels/concurrency/processor";
 
@@ -55,19 +51,12 @@ import {
     encryptBinary as encryptBinaryHKDF,
     decryptBinary as decryptBinaryHKDF,
 } from "octagonal-wheels/encryption/hkdf";
-const RECORD_SPLIT = `\n`;
-const UNIT_SPLIT = `\u001f`;
-type ProcessingEntry = PouchDB.Core.PutDocument<EntryDoc> & PouchDB.Core.GetMeta;
-
-const te = new TextEncoder();
-function serializeDoc(doc: EntryDoc): Uint8Array {
-    if (doc._id.startsWith("h:")) {
-        const data = (doc as EntryLeaf).data;
-        const writeData = escapeNewLineFromString(data);
-        return te.encode(`~${doc._id}${UNIT_SPLIT}${writeData}${RECORD_SPLIT}`);
-    }
-    return te.encode(JSON.stringify(doc) + RECORD_SPLIT);
-}
+import {
+    decodeJournalEntryStream,
+    inflateJournalEntryStream,
+    serializeJournalEntry,
+    type ProcessingEntry,
+} from "./JournalSyncSerialization.ts";
 
 export abstract class JournalSyncAbstract {
     _settings: BucketSyncSetting;
@@ -118,6 +107,7 @@ export abstract class JournalSyncAbstract {
     requestedStop = false;
     trench: Trench;
     notifier = new Notifier();
+    compaction: JournalSyncCompaction;
 
     getInitialSyncParameters(): Promise<SyncParameters> {
         return Promise.resolve({
@@ -164,6 +154,7 @@ export abstract class JournalSyncAbstract {
         this.store = store;
         this.hash = this.getHash(settings);
         this.trench = new Trench(store);
+        this.compaction = new JournalSyncCompaction(this);
         clearHandlers();
     }
     applyNewConfig(settings: BucketSyncSetting, store: SimpleStore<CheckPointInfo>, env: LiveSyncJournalReplicatorEnv) {
@@ -172,6 +163,7 @@ export abstract class JournalSyncAbstract {
         this.processReplication = async (docs) => await env.services.replication.parseSynchroniseResult(docs);
         this.store = store;
         this.hash = this.getHash(settings);
+        this.compaction.client = this;
         clearHandlers();
     }
 
@@ -301,8 +293,20 @@ export abstract class JournalSyncAbstract {
 
     abstract uploadJson<T>(key: string, body: any): Promise<T | boolean>;
     abstract downloadJson<T>(key: string): Promise<T | false>;
+    abstract uploadJsonConditional<T>(
+        key: string,
+        body: any,
+        condition: ObjectStoreUploadCondition
+    ): Promise<ConditionalUploadResult | T>;
+    abstract downloadJsonWithMetadata<T>(key: string): Promise<DownloadedJsonWithMetadata<T> | false>;
 
     abstract uploadFile(key: string, blob: Blob, mime: string): Promise<boolean>;
+    abstract uploadFileConditional(
+        key: string,
+        blob: Blob,
+        mime: string,
+        condition: ObjectStoreUploadCondition
+    ): Promise<ConditionalUploadResult>;
     abstract downloadFile(key: string): Promise<Uint8Array | false>;
     abstract listFiles(from: string, limit?: number): Promise<string[]>;
     abstract listFilesByPrefix(prefix: string): Promise<string[]>;
@@ -583,7 +587,7 @@ export abstract class JournalSyncAbstract {
                         Logger(`Packing Journal: ${currentSeq} / ${seqToProcess}`, logLevel, MSG_KEY);
                         // this.updateInfo({ maxPushSeq: max, sent: currentLastSeq as number, lastSyncPushSeq: startSeq })
                         for (const row of changes) {
-                            const serialized = serializeDoc(row);
+                            const serialized = serializeJournalEntry(row);
                             sentIDs.add(this.getDocKey(row));
                             binarySize += serialized.length;
                             outBuf.push(serialized);
@@ -654,10 +658,10 @@ export abstract class JournalSyncAbstract {
     }
     async _getRemoteJournals() {
         const checkPointInfo = await this.getCheckpointInfo();
-        const StartAfter = [...checkPointInfo.receivedFiles.keys()].sort((a, b) =>
-            b.localeCompare(a, undefined, { numeric: true })
-        )[0];
-        const files = (await this.listFiles(StartAfter)).filter((e) => !e.startsWith("_"));
+        // StartAfter must reflect what we have actually *received/applied*.
+        // Using sentFiles here can skip remote journals after a push-only run.
+        const StartAfter = computeCursorFromJournalFileSets(checkPointInfo.receivedFiles, []);
+        const files = (await this.listFiles(StartAfter ?? "")).filter((e) => !e.startsWith("_"));
         if (!files) return [];
         return files.sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
     }
@@ -787,40 +791,8 @@ export abstract class JournalSyncAbstract {
                     Logger(`${TASK_TITLE} Something went wrong on processing queue ${key}.`, LOG_LEVEL_NOTICE);
                     return false;
                 }
-                const compressed = new Uint8Array(value);
-                const decompressed = await wrappedInflate(compressed, { consume: true });
-                if (decompressed.length == 0) {
-                    await commit();
-                    downloaded++;
-                    Logger(`${TASK_TITLE}: ${key} has been processed`, LOG_LEVEL_INFO);
-                    continue;
-                }
-                let idxFrom = 0;
-                let idxTo = 0;
-                const d = new TextDecoder();
-                const result = [] as ProcessingEntry[];
-                do {
-                    idxTo = decompressed.indexOf(0x0a, idxFrom);
-                    if (idxTo == -1) {
-                        break;
-                    }
-                    const piece = decompressed.slice(idxFrom, idxTo);
-                    const strPiece = d.decode(piece);
-                    if (strPiece.startsWith("~")) {
-                        const [key, data] = strPiece.substring(1).split(UNIT_SPLIT);
-                        result.push({
-                            _id: key as DocumentID,
-                            data: unescapeNewLineFromString(data),
-                            type: "leaf",
-                            _rev: "", // It may ignored.
-                        });
-                    } else {
-                        result.push(JSON.parse(strPiece));
-                    }
-                    idxFrom = idxTo + 1;
-                } while (idxTo > 0);
                 try {
-                    if (await this.processDocuments(result)) {
+                    if (await this.processCompressedJournalBytes(key, value)) {
                         await commit();
                         downloaded++;
                         Logger(`${TASK_TITLE}: ${key} has been processed`, LOG_LEVEL_INFO);
@@ -838,6 +810,13 @@ export abstract class JournalSyncAbstract {
             } while (this.requestedStop == false);
             return true;
         });
+    }
+
+    async processCompressedJournalBytes(_key: string, value: Uint8Array): Promise<boolean> {
+        const decompressed = await inflateJournalEntryStream(value);
+        if (decompressed.length == 0) return true;
+        const result = decodeJournalEntryStream(decompressed);
+        return await this.processDocuments(result);
     }
 
     isDownloading = false;
@@ -896,9 +875,14 @@ export abstract class JournalSyncAbstract {
         });
     }
 
+    async runPrefixCompaction(ownerDeviceId: DeviceID): Promise<boolean> {
+        return await this.compaction.runPrefixCompaction(ownerDeviceId);
+    }
+
     async receiveRemoteJournal(showMessage = false) {
         this.updateInfo({ syncStatus: "JOURNAL_RECEIVE" });
         this.requestedStop = false;
+        await this.compaction.applyCompactSegmentsToLocalCheckpoint();
         const results = await Promise.all([
             this.downloadRemoteJournals(showMessage),
             this.processDownloadedJournals(showMessage),

@@ -11,6 +11,11 @@ import type { RemoteDBStatus } from "../../LiveSyncAbstractReplicator.ts";
 import { promiseWithResolver } from "octagonal-wheels/promises";
 import type { SourceData } from "@smithy/types";
 import { clearHandlers } from "../../SyncParamsHandler.ts";
+import type {
+    ConditionalUploadResult,
+    DownloadedJsonWithMetadata,
+    ObjectStoreUploadCondition,
+} from "../JournalSyncTypes.ts";
 
 export class JournalSyncMinio extends JournalSyncAbstract {
     _instance?: S3;
@@ -144,6 +149,22 @@ export class JournalSyncMinio extends JournalSyncAbstract {
             return false;
         }
     }
+
+    async uploadJsonConditional(key: string, body: any, condition: ObjectStoreUploadCondition) {
+        try {
+            return await this.uploadFileConditional(
+                key,
+                new Blob([JSON.stringify(body)]),
+                "application/json",
+                condition
+            );
+        } catch (ex) {
+            Logger(`Could not conditionally upload json ${key}`);
+            Logger(ex, LOG_LEVEL_VERBOSE);
+            return false;
+        }
+    }
+
     async downloadJson<T>(key: string): Promise<T | false> {
         try {
             const ret = await this.downloadFile(key, true);
@@ -156,7 +177,49 @@ export class JournalSyncMinio extends JournalSyncAbstract {
         }
     }
 
+    async downloadJsonWithMetadata<T>(key: string): Promise<DownloadedJsonWithMetadata<T> | false> {
+        const client = this._getClient();
+        const cmd = new GetObjectCommand({
+            Bucket: this.bucket,
+            Key: `${this.prefix}${key}`,
+            ResponseCacheControl: "no-cache",
+        });
+        try {
+            const r = await client.send(cmd);
+            if (!r.Body) return false;
+            const set = this.currentSettings;
+            const u = new Uint8Array(await r.Body.transformToByteArray());
+            const decrypted = await this.decryptDownloaded(key, u, set);
+            return {
+                body: JSON.parse(new TextDecoder().decode(decrypted)) as T,
+                etag: r.ETag,
+            };
+        } catch (ex) {
+            Logger(`Could not download json ${key}`);
+            Logger(ex, LOG_LEVEL_VERBOSE);
+            return false;
+        }
+    }
+
     async uploadFile(key: string, blob: Blob, mime: string) {
+        return (await this.uploadFileInternal(key, blob, mime)) === true;
+    }
+
+    async uploadFileConditional(
+        key: string,
+        blob: Blob,
+        mime: string,
+        condition: ObjectStoreUploadCondition
+    ): Promise<ConditionalUploadResult> {
+        return await this.uploadFileInternal(key, blob, mime, condition);
+    }
+
+    async uploadFileInternal(
+        key: string,
+        blob: Blob,
+        mime: string,
+        condition?: ObjectStoreUploadCondition
+    ): Promise<ConditionalUploadResult> {
         try {
             const buf = new Uint8Array(await blob.arrayBuffer());
             const set = this.currentSettings;
@@ -167,11 +230,18 @@ export class JournalSyncMinio extends JournalSyncAbstract {
                 Key: `${this.prefix}${key}`,
                 Body: u,
                 ContentType: mime,
+                ...(condition && "ifNoneMatch" in condition ? { IfNoneMatch: condition.ifNoneMatch } : {}),
+                ...(condition && "ifMatch" in condition ? { IfMatch: condition.ifMatch } : {}),
             });
             if (await client.send(cmd)) {
                 return true;
             }
         } catch (ex) {
+            const statusCode = (ex as { $metadata?: { httpStatusCode?: number } }).$metadata?.httpStatusCode;
+            const name = (ex as { name?: string }).name;
+            if (statusCode === 409 || statusCode === 412 || name === "PreconditionFailed") {
+                return "precondition-failed";
+            }
             Logger(`Could not upload ${key}`);
             Logger(ex, LOG_LEVEL_VERBOSE);
         }
